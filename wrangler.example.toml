@@ -1,0 +1,174 @@
+# Cloudflare Worker: Gestu managed-inference backend (Free + Pro) on https://api.gestu.ca
+#
+# Everything in [vars] is public configuration and is reviewed in this repo. Every secret is set
+# out of band with `wrangler secret put <NAME>` and is listed in cloudflare/RUNBOOK.md — never here.
+#
+# Customer-facing naming rule: the managed route is "Managed by Gestu". Both managed tiers route to
+# the same private upstream (DeepSeek Direct API); the provider name is internal routing only and
+# must never appear in a response, header, error body, log line a customer can see, or any
+# customer-facing copy.
+#
+# Deploy:  npx wrangler deploy
+# Local:   npx wrangler dev
+# Smoke:   curl https://api.gestu.ca/health
+
+name = "gestu-pro-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-09-23"
+workers_dev = true
+
+[[routes]]
+pattern = "api.gestu.ca/*"
+zone_name = "gestu.ca"
+
+[[routes]]
+pattern = "pro.gestu.ca/*"
+zone_name = "gestu.ca"
+
+[vars]
+# ---- Plans & quotas (LOCKED 2-tier: Free $0 / Pro $14.99/mo) --------------------------------
+GESTU_PRODUCT_ID = "gestu_pro_monthly"
+GESTU_BASE_PLAN_ID = "gestu-pro-monthly"
+# Pro combined monthly ceiling = 1,500,000 output + 100,000,000 input tokens (split caps live in
+# src/constants.ts and are the product promise; this is the KV backstop).
+GESTU_MONTHLY_TOKEN_LIMIT = "101500000"
+# Monthly soft cap in micro-USD for licence-backed Pro keys ($10.00 = 10,000,000 µUSD; hard stop at
+# 150% = $15.00). Sits well below the $14.99 Pro list price so a runaway month cannot erase the
+# subscription margin while it backs up the locked 1.5M-output / 100M-input token caps.
+GESTU_MONTHLY_CAP_MICRO_USD = "10000000"
+# Price table in USD per 1M tokens (= µUSD per single token), used for µUSD metering of
+# licence-backed keys. DeepSeek Direct `deepseek-flash` (2026-10): off-peak $0.003 cache-hit /
+# $0.15 cache-miss / $0.60 output, peak double. Azure AI Foundry `DeepSeek-V4.1-Flash-1017`
+# (GlobalStandard flat): $0.03 cache-hit / $0.30 cache-miss / $1.20 output.
+GESTU_PRICE_TABLE = '{"default":{"offPeak":{"cacheHit":0.003,"cacheMiss":0.15,"output":0.60},"peak":{"cacheHit":0.006,"cacheMiss":0.30,"output":1.20}},"DeepSeek-V4.1-Flash-1017":{"cacheHit":0.03,"cacheMiss":0.30,"output":1.20}}'
+GESTU_ALLOWED_PACKAGE_NAMES = "com.assistant.gestu,app.gestu.assistant,app.gestu.assistant.foss,app.gestu.assistant.windows,com.gestu.app,ca.gestu.app"
+
+# ---- Pro upstream (internal only; never advertised) ------------------------------------------
+# DeepSeek Direct API, OpenAI-compatible. The Worker appends /chat/completions and authenticates
+# with the UPSTREAM_API_KEY secret (legacy name: DEEPSEEK_API_KEY).
+UPSTREAM_BASE_URL = "https://api.deepseek.com/v1"
+UPSTREAM_MODEL_ID = "deepseek-flash"
+# Optional secondary managed host: configuration only, never a fallback to the default upstream.
+UPSTREAM_FALLBACK_BASE_URL = ""
+UPSTREAM_FALLBACK_MODEL_ID = ""
+
+# ---- Free trial & emergency abuse guardrail ---------------------------------------------------
+# Normal Free trial users are governed by per-user trial limits (7-day window or $0.50 cap in
+# LicenceMeter) — NOT by a low global kill switch — so 200-350 daily testers never lock out new
+# signups. The emergency daily cap below is strictly a high abuse guardrail against distributed
+# bot-farm attacks (default $500/day; set to "0" or "off" to disable).
+GESTU_FREE_TRIAL_DAYS = "7"
+GESTU_FREE_EMERGENCY_DAILY_CAP_USD = "500"
+
+# ---- Free upstream (internal only) -----------------------------------------------------------
+# Azure AI Foundry Serverless API (`DeepSeek-V4.1-Flash-1017`). Authenticates with
+# `DEEPSEEK_FREE_API_KEY` secret (never committed).
+FREE_UPSTREAM_BASE_URL = "https://<REDACTED_UPSTREAM_HOST>/openai/v1"
+FREE_UPSTREAM_MODEL_ID = "DeepSeek-V4.1-Flash-1017"
+
+GESTU_EXPOSED_MODELS = "gestu-pro-flash"
+GESTU_DEVICE_LIMIT = "2"
+# Both managed tiers are served from api.gestu.ca (ProCatalog.ACCOUNT_BASE_URL / MANAGED_PROXY_BASE_URL).
+GESTU_PUBLIC_BASE_URL = "https://api.gestu.ca"
+GESTU_ALLOWED_ORIGINS = ""
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_PLAY_API_BASE = "https://androidpublisher.googleapis.com/androidpublisher/v3"
+RTDN_AUDIENCE = "https://api.gestu.ca/api/rtdn"
+
+[[kv_namespaces]]
+binding = "PRO_KV"
+id = "<REDACTED_KV_NAMESPACE_ID>"
+preview_id = "<REDACTED_KV_PREVIEW_ID>"
+
+# Short-window anti-abuse for the Free route only. Pro has no per-minute throttle: its bound is
+# the LicenceMeter spend cap and the monthly token allowance, both charged per request, so a burst
+# can exhaust an allowance sooner but cannot exceed it.
+#
+# These bindings are why the route no longer writes a KV counter per request: the free plan allows
+# ~1,000 KV writes/day, which at four writes per metered request is only ~250 requests — the limiter
+# was exhausting its own quota and then failing closed.
+#
+# A binding accepts a period of only 10 or 60 seconds and carries exactly one limit, which is why
+# there is one binding per ceiling rather than one shared namespace. The KV counters in src/free.ts
+# remain as the fallback (and for the day windows a binding cannot express); they are skipped
+# whenever the matching binding answers, so keep these in sync with src/constants.ts:
+#   FREE_RATE_LIMITER     FREE_CHAT_RATE_LIMIT     100/60 s
+#   FREE_IP_RATE_LIMITER  FREE_IP_CHAT_RATE_LIMIT  200/60 s
+[[ratelimits]]
+name = "FREE_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 100, period = 60 }
+
+[[ratelimits]]
+name = "FREE_IP_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 200, period = 60 }
+
+[[durable_objects.bindings]]
+name = "LICENCE_METER"
+class_name = "LicenceMeter"
+
+[[durable_objects.bindings]]
+# One object per (scope, identity) holding a day counter. The day windows are the last thing on the
+# Free path that had to write KV, and KV writes are the account's scarce resource on the free plan.
+name = "ACCESS_METER"
+class_name = "AccessMeter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LicenceMeter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["AccessMeter"]
+
+[triggers]
+crons = ["17 4 * * *"]
+
+[observability]
+enabled = true
+# Only a sample of requests is retained. The exact per-user counters are in KV and the
+# LicenceMeter Durable Object; logs are for failures and the `chat.usage` forensic line, not for
+# reconciling spend. Raising this multiplies log volume on every completion.
+head_sampling_rate = 0.1
+
+# ---- Operator usage reporting ----------------------------------------------------------------
+# `GET /admin/usage?period=YYYY-MM[&format=json|csv]` (src/admin-usage.ts).
+# Requires the ADMIN_USAGE_SECRET secret:
+#   wrangler secret put ADMIN_USAGE_SECRET
+# It is intentionally a different credential from entitlement-service's ADMIN_SECRET: this one can
+# only read counters, never issue or revoke a licence.
+#
+# Optional per-request Analytics Engine dataset. Uncomment and deploy to receive one data point per
+# metered completion (blobs: tier, productId, licenceId; doubles: prompt, completion, total, ts).
+# Leaving it out changes nothing: the Worker skips the write when the binding is absent.
+# [[analytics_engine_datasets]]
+# binding = "USAGE_ANALYTICS"
+# dataset = "gestu_usage"
+#
+# ---- PII-free server-side funnel counters (D1) -----------------------------------------------
+# Stores only 4 daily UTC aggregate integers (`trial_started`, `trial_cap_hit`, `pro_activated`,
+# `day7_active`) — zero user PII, zero device IDs, zero prompt content. Read via `GET /admin/funnel`.
+# Provision once with:
+#   npx wrangler d1 create gestu-funnel-metrics
+#   npx wrangler d1 migrations apply gestu-funnel-metrics --remote
+# Then uncomment and paste the database_id below:
+[[d1_databases]]
+binding = "FUNNEL_DB"
+database_name = "gestu-funnel-metrics"
+database_id = "<REDACTED_D1_DATABASE_ID>"
+migrations_dir = "migrations"
+
+# ---- Operator exemptions ----------------------------------------------------------------------
+# A short list of devices/networks that are authenticated normally but never refused for capacity:
+# no Free per-IP new-device cap, no rate windows, no monthly allowance, no Pro seat/concurrency
+# limit, and nothing is metered against them (usage still appears in the `chat.usage` telemetry
+# line). Revoked/expired grants are still refused — a state is not a limit. See `src/exempt.ts`.
+#
+# Both are SECRETS, not `[vars]`: the IP list would publish the deployment's own address.
+#   npx wrangler secret put GESTU_UNLIMITED_DEVICE_HASHES   # comma-separated sha256 hex
+#   npx wrangler secret put GESTU_UNLIMITED_IPS             # comma-separated public IPs
+#
+# Exemption is keyed on the client-asserted device id (hashed) or its edge address; it is not
+# authentication, and it does not apply to a request from an address that is not on the list.
+
